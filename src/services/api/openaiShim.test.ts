@@ -9920,6 +9920,7 @@ function makeJsonChatCompletion(body: Record<string, unknown>): Response {
 
 async function collectFallbackEvents(
   body: Record<string, unknown>,
+  model = 'fake-model',
 ): Promise<Array<Record<string, unknown>>> {
   const previousFetch = globalThis.fetch
   globalThis.fetch = (async () => makeJsonChatCompletion(body)) as unknown as FetchType
@@ -9927,7 +9928,7 @@ async function collectFallbackEvents(
     const client = createOpenAIShimClient({}) as OpenAIShimClient
     const result = await client.beta.messages
       .create({
-        model: 'fake-model',
+        model,
         messages: [{ role: 'user', content: 'hi' }],
         max_tokens: 64,
         stream: true,
@@ -10143,6 +10144,81 @@ test('JSON fallback: recovers raw-text tool call into tool_use block', async () 
     | undefined
   expect(stopEvent?.delta?.stop_reason).toBe('tool_use')
 
+})
+
+test('JSON fallback: recovers Tencent HY3 text tool calls into tool_use blocks', async () => {
+  const events = await collectFallbackEvents({
+    id: 'chatcmpl-json-hy3',
+    model: 'tencent/hy3',
+    choices: [
+      {
+        message: {
+          role: 'assistant',
+          content:
+            '<tool_call:call_hy3>TaskCreate\n subject: Verify HY3\n description: Run the live test\n</tool_call:call_hy3>',
+        },
+        finish_reason: 'stop',
+      },
+    ],
+  }, 'tencent/hy3')
+  const toolStart = events.find(
+    event =>
+      event.type === 'content_block_start' &&
+      typeof event.content_block === 'object' &&
+      event.content_block !== null &&
+      (event.content_block as Record<string, unknown>).type === 'tool_use',
+  ) as { content_block?: Record<string, unknown> } | undefined
+  expect(toolStart?.content_block).toMatchObject({
+    type: 'tool_use',
+    name: 'TaskCreate',
+  })
+  const jsonDelta = events.find(
+    event =>
+      event.type === 'content_block_delta' &&
+      typeof event.delta === 'object' &&
+      event.delta !== null &&
+      (event.delta as Record<string, unknown>).type === 'input_json_delta',
+  ) as { delta?: { partial_json?: string } } | undefined
+  expect(JSON.parse(jsonDelta?.delta?.partial_json ?? '')).toEqual({
+    subject: 'Verify HY3',
+    description: 'Run the live test',
+  })
+  const stopEvent = events.find(e => e.type === 'message_delta') as
+    | { delta?: { stop_reason?: string } }
+    | undefined
+  expect(stopEvent?.delta?.stop_reason).toBe('tool_use')
+})
+
+test('JSON fallback: preserves HY3-looking text for non-Tencent model names', async () => {
+  const text =
+    '<tool_call:example>TaskCreate\nsubject: merely a documentation example\n</tool_call:example>'
+  const events = await collectFallbackEvents({
+    id: 'chatcmpl-json-non-tencent-hy3',
+    model: 'other/hy3-documentation',
+    choices: [
+      {
+        message: { role: 'assistant', content: text },
+        finish_reason: 'stop',
+      },
+    ],
+  }, 'other/hy3-documentation')
+  const toolStart = events.find(
+    event =>
+      event.type === 'content_block_start' &&
+      typeof event.content_block === 'object' &&
+      event.content_block !== null &&
+      (event.content_block as Record<string, unknown>).type === 'tool_use',
+  )
+  const textDelta = events.find(
+    event =>
+      event.type === 'content_block_delta' &&
+      typeof event.delta === 'object' &&
+      event.delta !== null &&
+      (event.delta as Record<string, unknown>).type === 'text_delta',
+  ) as { delta?: { text?: string } } | undefined
+
+  expect(toolStart).toBeUndefined()
+  expect(textDelta?.delta?.text).toBe(text)
 })
 
 test('JSON fallback: empty tool_calls array does not block raw-text recovery', async () => {
